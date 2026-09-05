@@ -7,6 +7,10 @@ Puntos clave de la implementación:
   `max_tokens` (que quedó deprecado en los modelos nuevos), así que el
   campo genérico `max_tokens` de la config se mapea a ese parámetro.
 - `stream=True` + `async for` para el modo streaming.
+
+Esta clase además sirve de base para proveedores *compatibles con la API
+de OpenAI* (hoy: Kimi). Una subclase solo ajusta atributos de clase:
+`provider`, `nombre_proveedor`, `base_url` y `envia_temperature`.
 """
 
 from __future__ import annotations
@@ -29,19 +33,40 @@ def _usage_openai(usage) -> dict[str, int] | None:
 
 
 class OpenAIClient(BaseLLMClient):
-    """Implementación concreta para OpenAI."""
+    """Implementación concreta para OpenAI.
+
+    Atributos de clase que una subclase puede ajustar (p. ej. Kimi):
+        provider           -> Provider que identifica a este cliente.
+        nombre_proveedor   -> etiqueta usada en los mensajes de error.
+        base_url           -> endpoint del SDK (None = el oficial de OpenAI).
+        envia_temperature  -> False si el proveedor fija temperature solo
+                              (kimi-k3 la fija en 1.0 y exige omitirla).
+    parametros_extra   -> dict de params fijos a inyectar en cada request
+                          vía extra_body (p. ej. kimi-k2.6 desactiva su
+                          "thinking").
+    """
 
     provider = Provider.OPENAI
+    nombre_proveedor: str = "OpenAI"
+    base_url: str | None = None
+    envia_temperature: bool = True
+    # Params fijos que una subclase puede inyectar en cada request
+    # (p. ej. Kimi desactiva el "thinking" de kimi-k2.6). Se envían
+    # como `extra_body` (los kwargs de create() están tipados).
+    parametros_extra: dict[str, object] = {}
 
     def __init__(self, config: LLMConfig) -> None:
         super().__init__(config)
         import openai
 
-        self._cliente = openai.AsyncOpenAI(
-            api_key=self._api_key(),
-            max_retries=config.max_retries,
-            timeout=config.timeout,
-        )
+        parametros: dict[str, object] = {
+            "api_key": self._api_key(),
+            "max_retries": config.max_retries,
+            "timeout": config.timeout,
+        }
+        if self.base_url is not None:
+            parametros["base_url"] = self.base_url
+        self._cliente = openai.AsyncOpenAI(**parametros)
 
     # ------------------------------------------------------------------
     # Implementación de la interfaz base
@@ -52,9 +77,14 @@ class OpenAIClient(BaseLLMClient):
         params = {
             "model": self.config.model,
             "messages": [m.to_dict() for m in mensajes],
-            "temperature": self.config.temperature,
             "max_completion_tokens": self.config.max_tokens,
         }
+        if self.envia_temperature:
+            params["temperature"] = self.config.temperature
+        # Los params no estándar van por extra_body: `create()` solo
+        # acepta kwargs tipados del SDK, y extra_body los mete al JSON.
+        if self.parametros_extra:
+            params["extra_body"] = self.parametros_extra
         params.update(fusionar_extra(extra, params))
 
         respuesta = await self._cliente.chat.completions.create(**params)
@@ -74,10 +104,14 @@ class OpenAIClient(BaseLLMClient):
         params = {
             "model": self.config.model,
             "messages": [m.to_dict() for m in mensajes],
-            "temperature": self.config.temperature,
             "max_completion_tokens": self.config.max_tokens,
             "stream": True,
         }
+        if self.envia_temperature:
+            params["temperature"] = self.config.temperature
+        # Los params no estándar van por extra_body (ver _pedir_completos).
+        if self.parametros_extra:
+            params["extra_body"] = self.parametros_extra
         params.update(fusionar_extra(extra, params))
 
         # `create(stream=True)` ya devuelve el objeto stream; iteramos.
@@ -94,7 +128,10 @@ class OpenAIClient(BaseLLMClient):
 
         if isinstance(exc, openai.AuthenticationError):
             return ErrorNormalizado(
-                "API key de OpenAI inválida o vencida.", "authentication", 401, False
+                f"API key de {self.nombre_proveedor} inválida o vencida.",
+                "authentication",
+                401,
+                False,
             )
         if isinstance(exc, openai.PermissionDeniedError):
             return ErrorNormalizado(
@@ -102,7 +139,8 @@ class OpenAIClient(BaseLLMClient):
             )
         if isinstance(exc, openai.NotFoundError):
             return ErrorNormalizado(
-                f"Modelo o recurso no encontrado: '{self.config.model}'.",
+                f"Modelo o recurso no encontrado en {self.nombre_proveedor}: "
+                f"'{self.config.model}'.",
                 "not_found",
                 404,
                 False,
@@ -113,27 +151,36 @@ class OpenAIClient(BaseLLMClient):
             )
         if isinstance(exc, openai.RateLimitError):
             return ErrorNormalizado(
-                "Límite de tasa de OpenAI alcanzado (429).", "rate_limit", 429, True
+                f"Límite de tasa de {self.nombre_proveedor} alcanzado (429).",
+                "rate_limit",
+                429,
+                True,
             )
         if isinstance(exc, openai.APITimeoutError):
             return ErrorNormalizado(
-                "Tiempo de espera agotado al contactar a OpenAI.",
+                f"Tiempo de espera agotado al contactar a {self.nombre_proveedor}.",
                 "timeout",
                 None,
                 True,
             )
         if isinstance(exc, openai.APIConnectionError):
             return ErrorNormalizado(
-                f"Error de conexión con OpenAI: {exc}", "connection", None, True
+                f"Error de conexión con {self.nombre_proveedor}: {exc}",
+                "connection",
+                None,
+                True,
             )
         if isinstance(exc, openai.APIStatusError):
             codigo = getattr(exc, "status_code", None)
             return ErrorNormalizado(
-                f"OpenAI respondió con error HTTP {codigo}: {exc}",
+                f"{self.nombre_proveedor} respondió con error HTTP {codigo}: {exc}",
                 "api_status",
                 codigo,
                 codigo is not None and (codigo == 429 or codigo >= 500),
             )
         return ErrorNormalizado(
-            f"Error inesperado de OpenAI: {exc}", "unknown", None, False
+            f"Error inesperado de {self.nombre_proveedor}: {exc}",
+            "unknown",
+            None,
+            False,
         )

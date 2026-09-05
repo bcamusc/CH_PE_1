@@ -35,9 +35,9 @@ def construir_manager() -> AsyncLLMManager:
         print()
         print("Revisa tu archivo .env:")
         print("  1) Copia .env.example a .env")
-        print("  2) Define LLM_PROVIDER=openai o LLM_PROVIDER=anthropic")
-        print("  3) Pega la API key correspondiente (OPENAI_API_KEY o")
-        print("     ANTHROPIC_API_KEY)")
+        print("  2) Define LLM_PROVIDER=openai, anthropic o kimi")
+        print("  3) Pega la API key correspondiente (OPENAI_API_KEY,")
+        print("     ANTHROPIC_API_KEY o KIMI_API_KEY)")
         sys.exit(1)
 
 

@@ -21,6 +21,7 @@ class Provider(str, Enum):
 
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
+    KIMI = "kimi"
 
 
 class ChatMessage(BaseModel):
@@ -52,6 +53,7 @@ class LLMConfig(BaseModel):
     # API keys. Solo se exige la del proveedor activo (ver validador).
     openai_api_key: Optional[SecretStr] = None
     anthropic_api_key: Optional[SecretStr] = None
+    kimi_api_key: Optional[SecretStr] = None
 
     temperature: float = Field(
         default=0.7,

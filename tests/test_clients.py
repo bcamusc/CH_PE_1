@@ -16,6 +16,7 @@ from pydantic import SecretStr, ValidationError
 
 from llm_client.anthropic_client import AnthropicClient
 from llm_client.base import LLMClientError
+from llm_client.kimi_client import KimiClient
 from llm_client.manager import AsyncLLMManager
 from llm_client.openai_client import OpenAIClient
 from llm_client.schemas import ChatMessage, LLMConfig, ModelResponse, Provider
@@ -30,6 +31,7 @@ def _config(provider: Provider, **cambios) -> LLMConfig:
         "model": "modelo-de-prueba",
         "openai_api_key": SecretStr("sk-prueba") if provider is Provider.OPENAI else None,
         "anthropic_api_key": SecretStr("sk-ant-prueba") if provider is Provider.ANTHROPIC else None,
+        "kimi_api_key": SecretStr("sk-kimi-prueba") if provider is Provider.KIMI else None,
     }
     datos.update(cambios)
     return LLMConfig(**datos)
@@ -153,6 +155,23 @@ class TestSchemas(unittest.TestCase):
                 provider=Provider.OPENAI,
                 model="gpt-4o-mini",
                 anthropic_api_key=SecretStr("sk-ant-prueba"),
+            )
+
+    def test_falta_api_key_de_kimi(self):
+        with self.assertRaises(ValidationError):
+            LLMConfig(
+                provider=Provider.KIMI,
+                model="kimi-k2.6",
+                kimi_api_key=None,
+            )
+
+    def test_api_key_de_otro_proveedor_no_habilita_kimi(self):
+        # Tener la key de OpenAI NO habilita Kimi.
+        with self.assertRaises(ValidationError):
+            LLMConfig(
+                provider=Provider.KIMI,
+                model="kimi-k2.6",
+                openai_api_key=SecretStr("sk-prueba"),
             )
 
 
@@ -304,6 +323,98 @@ class TestAnthropicClient(unittest.IsolatedAsyncioTestCase):
 
 
 # ----------------------------------------------------------------------
+# Tests del cliente Kimi (hereda de OpenAIClient: API compatible)
+# ----------------------------------------------------------------------
+class TestKimiClient(unittest.IsolatedAsyncioTestCase):
+    """Kimi no duplica lógica: reutiliza OpenAIClient con otros atributos."""
+
+    async def test_apunta_al_endpoint_de_moonshot(self):
+        # Construir AsyncOpenAI no toca la red; verificamos el base_url.
+        # OJO: el SDK normaliza la URL (objeto URL + barra final).
+        cliente = KimiClient(_config(Provider.KIMI))
+        self.assertEqual(
+            str(cliente._cliente.base_url).rstrip("/"),
+            "https://api.moonshot.ai/v1",
+        )
+
+    async def test_generate_modo_normal(self):
+        cliente = KimiClient(_config(Provider.KIMI))
+        cliente._cliente = _fake_openai_cliente(_respuesta_openai())
+
+        respuesta = await cliente.generate(
+            [ChatMessage(role="user", content="¿Qué es la entropía?")]
+        )
+
+        self.assertTrue(respuesta.ok)
+        self.assertEqual(respuesta.provider, Provider.KIMI)
+        self.assertIn("entropía", respuesta.content)
+        self.assertEqual(respuesta.usage["total_tokens"], 15)
+
+        # Reutiliza el formato de OpenAI, incluido max_completion_tokens.
+        llamada = cliente._cliente.chat.completions.create.await_args.kwargs
+        self.assertEqual(llamada["model"], "modelo-de-prueba")
+        self.assertEqual(llamada["max_completion_tokens"], 1024)
+        # Kimi (kimi-k3) fija temperature: no debe ir en el request.
+        self.assertNotIn("temperature", llamada)
+
+    async def test_streaming(self):
+        cliente = KimiClient(_config(Provider.KIMI))
+        cliente._cliente = _fake_openai_cliente(
+            _gen_openai(["Hola ", "Kimi ", "async."])
+        )
+
+        partes = []
+        async for trozo in cliente.stream(
+            [ChatMessage(role="user", content="Hola")]
+        ):
+            partes.append(trozo)
+
+        self.assertEqual("".join(partes), "Hola Kimi async.")
+
+    async def test_desactiva_thinking_en_kimi_k26(self):
+        # kimi-k2.6 piensa por defecto y puede dejar content vacío:
+        # el cliente debe mandar thinking disabled (vía extra_body).
+        cliente = KimiClient(_config(Provider.KIMI, model="kimi-k2.6"))
+        cliente._cliente = _fake_openai_cliente(_respuesta_openai())
+
+        await cliente.generate([ChatMessage(role="user", content="Hola")])
+
+        llamada = cliente._cliente.chat.completions.create.await_args.kwargs
+        self.assertEqual(llamada["extra_body"], {"thinking": {"type": "disabled"}})
+
+    async def test_no_envia_thinking_en_kimi_k3(self):
+        # kimi-k3 siempre piensa: no acepta el param thinking.
+        cliente = KimiClient(_config(Provider.KIMI, model="kimi-k3"))
+        cliente._cliente = _fake_openai_cliente(_respuesta_openai())
+
+        await cliente.generate([ChatMessage(role="user", content="Hola")])
+
+        llamada = cliente._cliente.chat.completions.create.await_args.kwargs
+        self.assertNotIn("extra_body", llamada)
+
+    async def test_error_404_habla_de_kimi_y_no_se_reintenta(self):
+        from openai import NotFoundError
+
+        cliente = KimiClient(_config(Provider.KIMI, max_retries=3))
+        create = AsyncMock(
+            side_effect=NotFoundError(
+                "modelo no existe", response=_respuesta_error(404), body=None
+            )
+        )
+        cliente._cliente = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        respuesta = await cliente.generate(
+            [ChatMessage(role="user", content="Hola")]
+        )
+
+        self.assertFalse(respuesta.ok)
+        self.assertIn("Kimi", respuesta.error or "")
+        self.assertEqual(create.await_count, 1)  # un 404 no se reintenta
+
+
+# ----------------------------------------------------------------------
 # Tests del manager (selección por configuración / entorno)
 # ----------------------------------------------------------------------
 class TestManager(unittest.TestCase):
@@ -330,6 +441,16 @@ class TestManager(unittest.TestCase):
             manager = AsyncLLMManager.desde_env()
         self.assertEqual(manager.provider, Provider.ANTHROPIC)
         self.assertEqual(manager.model, "claude-3-7-sonnet-latest")
+
+    def test_desde_env_kimi(self):
+        with patch.dict(
+            os.environ,
+            {"LLM_PROVIDER": "kimi", "KIMI_API_KEY": "sk-kimi-prueba"},
+            clear=False,
+        ):
+            manager = AsyncLLMManager.desde_env()
+        self.assertEqual(manager.provider, Provider.KIMI)
+        self.assertIsInstance(manager._cliente, KimiClient)
 
     def test_desde_env_falla_sin_api_key(self):
         with patch.dict(

@@ -1,9 +1,9 @@
 # Unified Async LLM Client
 
 Cliente de LLM **unificado**, **asíncrono** y con **streaming** para
-OpenAI y Anthropic, en Python 3.12. Implementa una interfaz común
-(`BaseLLMClient`) con validación Pydantic, reintentos con backoff y
-errores controlados (nada "crashea").
+OpenAI, Anthropic y Kimi (Moonshot AI), en Python 3.12. Implementa una
+interfaz común (`BaseLLMClient`) con validación Pydantic, reintentos con
+backoff y errores controlados (nada "crashea").
 
 > Pre-entrega 1 — Curso de LLMs. Repositorio con el código de los
 > clientes async, esquemas Pydantic, `.env.example`, `main.py` de prueba
@@ -20,6 +20,7 @@ errores controlados (nada "crashea").
 │   ├── schemas.py            #   Pydantic: ChatMessage, LLMConfig, ModelResponse
 │   ├── base.py               #   BaseLLMClient (ABC) + errores + reintentos
 │   ├── openai_client.py      #   OpenAIClient  (AsyncOpenAI)
+│   ├── kimi_client.py        #   KimiClient (hereda de OpenAIClient)
 │   ├── anthropic_client.py   #   AnthropicClient (AsyncAnthropic)
 │   └── manager.py            #   AsyncLLMManager: elige proveedor por config
 ├── main.py                   # Demo: pregunta normal + streaming
@@ -33,7 +34,7 @@ errores controlados (nada "crashea").
 ## 2. Requisitos
 
 - Python **3.12**
-- Una API key de OpenAI y/o Anthropic (según el proveedor que quieras usar)
+- Una API key del proveedor que quieras usar (OpenAI, Anthropic o Kimi)
 
 ## 3. Instalación
 
@@ -60,10 +61,11 @@ cp .env.example .env      # Windows: copy .env.example .env
 
 | Variable             | Obligatoria | Descripción                                          |
 |----------------------|-------------|------------------------------------------------------|
-| `LLM_PROVIDER`       | Sí          | Proveedor activo: `openai` o `anthropic`             |
+| `LLM_PROVIDER`       | Sí          | Proveedor activo: `openai`, `anthropic` o `kimi`     |
 | `OPENAI_API_KEY`     | Según el proveedor | Key de OpenAI (`sk-...`)                     |
 | `ANTHROPIC_API_KEY`  | Según el proveedor | Key de Anthropic (`sk-ant-...`)              |
-| `LLM_MODEL`          | No          | Modelo (vacío = sugerido: `gpt-4o-mini` / `claude-3-5-haiku-latest`) |
+| `KIMI_API_KEY`       | Según el proveedor | Key de Kimi de Moonshot AI (`sk-...`)       |
+| `LLM_MODEL`          | No          | Modelo (vacío = sugerido: `gpt-4o-mini` / `claude-haiku-4-5` / `kimi-k2.6`) |
 | `LLM_TEMPERATURE`    | No          | Creatividad, `0.0` a `2.0` (default `0.7`)           |
 | `LLM_MAX_TOKENS`     | No          | Máx. tokens a generar (default `1024`)               |
 
@@ -142,26 +144,29 @@ manager = AsyncLLMManager(config)
 
 ### 7.1 Intercambiabilidad
 `BaseLLMClient` es una clase abstracta (`ABC`) que define la interfaz:
-`generate()` y `stream()`. `OpenAIClient` y `AnthropicClient` la
-implementan y el `AsyncLLMManager` instancia la clase correcta según
-`LLMConfig.provider`. Quien consume el cliente **solo conoce la
-abstracción**.
+`generate()` y `stream()`. `OpenAIClient`, `KimiClient` y
+`AnthropicClient` la implementan y el `AsyncLLMManager` instancia la
+clase correcta según `LLMConfig.provider`. Quien consume el cliente
+**solo conoce la abstracción**.
 
 ### 7.2 Asincronía (no bloquees el event loop)
 Todo usa los SDKs asíncronos: `AsyncOpenAI` y `AsyncAnthropic`, siempre
-con `await`. Un error clásico es usar el cliente síncrono (`OpenAI` en
-vez de `AsyncOpenAI`) dentro de una función `async`: eso bloquea todo el
-programa mientras el modelo "piensa".
+con `await`. Kimi usa el SDK de OpenAI apuntando a su propio endpoint
+(API compatible), así que también corre sobre `AsyncOpenAI`. Un error
+clásico es usar el cliente síncrono (`OpenAI` en vez de `AsyncOpenAI`)
+dentro de una función `async`: eso bloquea todo el programa mientras el
+modelo "piensa".
 
 ### 7.3 Streaming con `yield`
-- **OpenAI**: `create(..., stream=True)` devuelve un `AsyncStream` que se
-  recorre con `async for chunk`; el texto está en `chunk.choices[0].delta.content`.
+- **OpenAI y Kimi**: `create(..., stream=True)` devuelve un `AsyncStream`
+  que se recorre con `async for chunk`; el texto está en
+  `chunk.choices[0].delta.content`.
 - **Anthropic**: `messages.stream(...)` se usa como *context manager*
   asíncrono y expone `text_stream`, un iterador asíncrono de fragmentos.
 
-En ambos casos el método `_pedir_stream()` es un **generador asíncrono**
-(`async def` + `yield`), así que los fragmentos se entregan al llamador
-en cuanto llegan.
+En todos los casos el método `_pedir_stream()` es un **generador
+asíncrono** (`async def` + `yield`), así que los fragmentos se entregan
+al llamador en cuanto llegan.
 
 ### 7.4 Validación con Pydantic (antes de tocar la red)
 `schemas.py` valida todo lo que entra y lo que sale:
@@ -169,8 +174,8 @@ en cuanto llegan.
 - `LLMConfig.temperature` debe estar en `[0, 2]`, `max_tokens > 0`.
 - `LLMConfig` exige la API key del proveedor activo (con `SecretStr`
   para no imprimir keys por accidente).
-- `ModelResponse` normaliza la salida de ambos proveedores y agrega el
-  campo `error` opcional.
+- `ModelResponse` normaliza la salida de todos los proveedores y agrega
+  el campo `error` opcional.
 
 Esto evita el típico "error de diccionarios anidados": si un mensaje
 está mal formado, el error aparece **aquí**, con mensaje claro.
@@ -194,6 +199,18 @@ está mal formado, el error aparece **aquí**, con mensaje claro.
 | Máx. tokens            | `max_completion_tokens`         | `max_tokens` (obligatorio)         |
 | Texto de la respuesta  | `choices[0].message.content`    | Bloques `content` con `type="text"` |
 | Streaming              | `stream=True` + `async for`     | `messages.stream(...)` + `text_stream` |
+
+### 7.7 Kimi: un proveedor "compatible con OpenAI" sin duplicar código
+Kimi (Moonshot AI) habla el **mismo protocolo** que OpenAI, así que
+`KimiClient` **hereda de `OpenAIClient`** y solo cambia atributos de
+clase: `provider`, `base_url` (`https://api.moonshot.ai/v1`),
+`envia_temperature=False` (kimi-k3 fija `temperature=1.0` y exige
+omitirla del request) y `parametros_extra` (kimi-k2.6 trae el modo
+"thinking" activado, que puede agotar los tokens razonando y dejar la
+respuesta vacía, así que se desactiva con `thinking: {"type":
+"disabled"}`). Todo lo demás —parsing, streaming, reintentos y errores—
+se reutiliza tal cual. Si aparece otro proveedor compatible (p. ej.
+DeepSeek, Groq, Mistral), basta una subclase similar con pocas líneas.
 
 ## 8. Notas de versiones probadas
 

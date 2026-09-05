@@ -1,6 +1,6 @@
 """`AsyncLLMManager`: una sola clase para hablar con cualquier proveedor.
 
-Selecciona el cliente concreto (OpenAI o Anthropic) según la
+Selecciona el cliente concreto (OpenAI, Anthropic o Kimi) según la
 configuración: o bien la pasas explícita (`LLMConfig`) o bien la arma
 desde variables de entorno con `AsyncLLMManager.desde_env()`.
 """
@@ -12,23 +12,26 @@ from collections.abc import AsyncIterator, Sequence
 
 from .anthropic_client import AnthropicClient
 from .base import BaseLLMClient
+from .kimi_client import KimiClient
 from .openai_client import OpenAIClient
 from .schemas import ChatMessage, LLMConfig, ModelResponse, Provider
 
 # Modelos sugeridos cuando no se define LLM_MODEL en el .env
 MODELOS_SUGERIDOS: dict[Provider, str] = {
     Provider.OPENAI: "gpt-4o-mini",
-    Provider.ANTHROPIC: "claude-3-5-haiku-latest",
+    Provider.ANTHROPIC: "claude-haiku-4-5",
+    Provider.KIMI: "kimi-k2.6",
 }
 
 _CLIENTES: dict[Provider, type[BaseLLMClient]] = {
     Provider.OPENAI: OpenAIClient,
     Provider.ANTHROPIC: AnthropicClient,
+    Provider.KIMI: KimiClient,
 }
 
 
 class AsyncLLMManager:
-    """Capa única para OpenAI y Anthropic, elegidos por configuración.
+    """Capa única para OpenAI, Anthropic y Kimi, elegidos por configuración.
 
     Uso típico:
 
@@ -84,9 +87,10 @@ class AsyncLLMManager:
         """Construye el manager leyendo el entorno (ideal tras `load_dotenv()`).
 
         Variables usadas:
-            LLM_PROVIDER       "openai" o "anthropic" (default: openai)
+            LLM_PROVIDER       "openai", "anthropic" o "kimi" (default: openai)
             OPENAI_API_KEY     key de OpenAI
             ANTHROPIC_API_KEY  key de Anthropic
+            KIMI_API_KEY       key de Kimi (Moonshot AI)
             LLM_MODEL          modelo (opcional; hay uno sugerido)
             LLM_TEMPERATURE    temperatura (default 0.7)
             LLM_MAX_TOKENS     máx. tokens (default 1024)
